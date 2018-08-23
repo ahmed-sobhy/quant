@@ -15,7 +15,7 @@ from collections import deque
 import numpy as np
 import random
 from pathlib import Path
-
+from backtrader.indicators import ema
 
 
 
@@ -33,9 +33,7 @@ class DQNAgent:
     def __init__(self, state_size, action_size):
         self.state_size = state_size
         self.action_size = action_size
-        self.memory_profit = deque(maxlen=5000)
-        self.memory_loss = deque(maxlen=5000)
-        self.memory_nothing = deque(maxlen=5000)
+        self.memory = deque(maxlen=5000)
         self.gamma = 0.95    # discount rate
         self.epsilon = 1.0  # exploration rate
         self.epsilon_min = 0.01
@@ -59,47 +57,39 @@ class DQNAgent:
         model.add(LSTM(self.state_size ,activation='relu', input_shape = (1, self.state_size),return_sequences=True))
         model.add(BatchNormalization())
         model.add(LSTM(self.state_size, activation='relu', return_sequences=True))
+        model.add(LSTM(self.state_size, activation='relu', return_sequences=True))
         model.add(BatchNormalization())
         model.add(Dense(self.state_size, activation='relu'))
-        model.add(Dense(self.action_size, activation='relu'))
+        model.add(Dense(self.action_size, activation='linear'))
         model.compile(loss='mse',
                       optimizer=Adam(lr=self.learning_rate))
         return model
 
     def remember(self, state, action, reward, next_state):
-        if action == 1:
-            if reward >= 0:
-                self.memory_profit.append((state, action, reward, next_state))
-            else:
-                self.memory_loss.append((state, action, reward, next_state))
-        else:
-            self.memory_nothing.append((state, action, reward, next_state))
+        self.memory.append((state, action, reward, next_state))
+
+
 
 
 
     def act(self, state):
         global EPSILON
         if np.random.rand() <= EPSILON:
-            if np.random.rand() < 0.05:
-                return 1
-            else:
+            r = np.random.rand()
+            if r < 0.95:
+                return 2
+            elif r < 0.975:
                 return 0
+            else:
+                return 1
 
         act_values = self.model.predict(state)
-        print(act_values)
-        self.a.append(np.argmax(act_values[0]))
         return np.argmax(act_values[0])  # returns action
 
     def replay(self, batch_size):
         minibatch = []
-        for i in range(int(batch_size/2)):
-            if(len(self.memory_profit) > 0 and i % 2 == 0):
-                minibatch.append(random.sample(self.memory_profit, 1)[0])
-            if (len(self.memory_loss) > 0  and i % 2 != 0):
-                minibatch.append(random.sample(self.memory_loss, 1)[0])
-            if(len(self.memory_nothing)>0):
-                minibatch.append(random.sample(self.memory_nothing, 1)[0])
-
+        for i in range(int(batch_size)):
+            minibatch.append(random.sample(self.memory, 1)[0])
         if len(minibatch) == 0:
             return
 
@@ -129,24 +119,24 @@ class TestStrategy(bt.Strategy):
 
         # To keep track of pending orders and buy price/commission
         self.order = None
-        self.buyprice = None
+        self.executed_price = None
         self.buycomm = None
 
         self.profit_trades = 0
         self.loss_trades = 0
 
 
-        self.dqn = DQNAgent(5, 2)
+        self.dqn = DQNAgent(20, 2)
 
         self.BUY = 1
-        self.NOTHING = 0
+        self.SELL = 0
 
         self.state = None
         self.next_state = None
         self.action = None
         self.reward = None
 
-        self.tp = 0.0010
+        self.tp = 0.0050
 
 
     def notify_order(self, order):
@@ -154,19 +144,35 @@ class TestStrategy(bt.Strategy):
             return
 
         if order.status in [order.Completed]:
-            if order.isbuy():
-                self.buyprice = order.executed.price
-                self.buycomm = order.executed.comm
-            else:
+            if not self.position and self.executed_price != None:
                 # update variable
                 self.next_state = self.get_state()
-                self.reward = (order.executed.price - self.buyprice) * 1000
-                self.dqn.remember(self.state, self.action, self.reward, self.next_state)
+                self.reward = (order.executed.price - self.executed_price) * 1000
 
-                if(order.executed.price - self.buyprice > 0):
-                    self.profit_trades += 1
+
+                if order.issell():
+                    if self.reward >= 0:
+                        self.profit_trades += 1
+                        self.dqn.remember(self.state, self.action, self.reward, self.next_state)
+                    else:
+                        self.loss_trades += 1
+                        self.dqn.remember(self.state, self.action, self.reward, self.next_state)
                 else:
-                    self.loss_trades += 1
+                    if self.reward <= 0:
+                        self.profit_trades += 1
+                        self.dqn.remember(self.state, self.action, -self.reward, self.next_state)
+                    else:
+                        self.loss_trades += 1
+                        self.dqn.remember(self.state, self.action, -self.reward, self.next_state)
+
+
+
+            self.executed_price = order.executed.price
+
+            #if order.isbuy():
+            #    print("Buy at %.4f" % (order.executed.price))
+            #if order.issell():
+            #    print("Sell at %.4f" % (order.executed.price))
 
         elif order.status in [order.Canceled, order.Margin, order.Rejected]:
             pass
@@ -183,8 +189,13 @@ class TestStrategy(bt.Strategy):
         l = []
         for i in range(0, self.dqn.state_size):
             l.append(self.dataclose[-i])
-        l = (np.array(l) / l[0]) - 1
+        l# = (np.array(l) / l[0]) - 1
+        l = np.array(l)
+        l[1:] = l[1:] - l[0]
+        l[0] = 0
         s = np.array(l).reshape((1, 1, self.dqn.state_size)) * 1000
+
+        ema = EMA(self.data, period=self.p.period_me1)
         return s
 
 
@@ -199,15 +210,18 @@ class TestStrategy(bt.Strategy):
             self.action = self.dqn.act(self.state)
             if self.action == self.BUY:
                 self.order = self.buy()
+            elif self.action == self.SELL:
+                pass
+                #self.order = self.sell()
             else:
-                self.dqn.remember(self.state, self.action, -self.tp*1000, self.state)
+                pass
         else:
-            price_diff = self.dataclose[0] - self.buyprice
+            price_diff = self.dataclose[0] - self.executed_price
             if abs(price_diff) >= self.tp:
-                self.order = self.sell()
+                self.close()
 
     def stop(self):
-        self.dqn.replay(min(1024,len(self.dqn.memory_profit + self.dqn.memory_nothing + self.dqn.memory_loss)))
+        self.dqn.replay(min(10000,len(self.dqn.memory)))
 
         self.log('Ending Value %.2f Profit Trades %.2f Loss Trades %0.2f Total Trades %.2f Mean %.2f' %
                  (self.broker.getvalue(),self.profit_trades, self.loss_trades, self.profit_trades+self.loss_trades, np.mean(self.dqn.a)), doprint=True)
@@ -222,7 +236,7 @@ if __name__ == '__main__':
     cerebro.addstrategy(TestStrategy)
 
     # Create a Data Feed
-    data = bt.feeds.GenericCSVData(dataname="/Users/ahmed/Desktop/forex_data/DAT_MT_EURUSD_M1_2011.csv",
+    data = bt.feeds.GenericCSVData(dataname="/Users/ahmed/Desktop/forex_data/DAT_MT_EURUSD_M1_2015.csv",
                                    dtformat=('%Y.%m.%d'),
                                    tmformat=("%H:%M"),
                                    datetime=0,
